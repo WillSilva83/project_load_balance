@@ -8,18 +8,15 @@ provider "aws" {
 
 
 ## VARIABLES 
-
 variable "server_port" {
   description = "A porta parao servidor que sera usada para request HTTP."
   default     = 8080
 }
 
-data "aws_availability_zones" "all" {
-
-}
+data "aws_availability_zones" "all" {}
 
 ## VPC 
-resource "aws_vpc" "vpc_instance" {
+resource "aws_vpc" "vpc_main" {
   cidr_block = "172.16.0.0/16"
 
   tags = {
@@ -30,48 +27,54 @@ resource "aws_vpc" "vpc_instance" {
 }
 
 ## SUBNETS 
-resource "aws_subnet" "vpc_subnet_instance" {
-  vpc_id            = aws_vpc.vpc_instance.id
+resource "aws_subnet" "subnet_a" {
+  vpc_id            = aws_vpc.vpc_main.id
   cidr_block        = "172.16.10.0/24"
   availability_zone = "sa-east-1a"
 
   tags = {
-    Name = "SUBNET_DEV_INSTANCE"
+    Name = "subnet-a-terraform"
   }
 
 }
-resource "aws_subnet" "subnet_ebl" {
-  vpc_id            = aws_vpc.vpc_instance.id
+resource "aws_subnet" "subnet_b" {
+  vpc_id            = aws_vpc.vpc_main.id
   cidr_block        = "172.16.20.0/24"
-  availability_zone = "sa-east-1a"
+  availability_zone = "sa-east-1b"
 
   tags = {
-    Name = "SUBNET_DEV_ELB"
+    Name = "subnet-b-terraform"
   }
 }
 
-## INTERFACE 
-resource "aws_network_interface" "vpc_network_instance" {
-  subnet_id   = aws_subnet.vpc_subnet_instance.id
-  private_ips = ["172.16.10.100"]
+
+## INTERNET GATEWAY 
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.vpc_main.id
 
   tags = {
-    Name = "NETWORK_INTERFACE_DEV_INSTANCE"
+    Name = "terraform-igw"
   }
-
 }
 
 ## SECURITYS GROUP 
-resource "aws_security_group" "instance" {
+resource "aws_security_group" "sg_main" {
   name        = "sg_instance"
-  description = "Security Group para uma instancia AWS."
-  vpc_id      = aws_vpc.vpc_instance.id
+  description = "Security Group."
+  vpc_id      = aws_vpc.vpc_main.id
 
 
   ingress {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
@@ -80,101 +83,140 @@ resource "aws_security_group" "instance" {
   }
 
   tags = {
-    Name = "SG_INSTANCE_DEV"
+    Name = "terraform-sg-main"
   }
 
 }
 
-resource "aws_security_group" "elb" {
-  name   = "terraform-elb"
-  vpc_id = aws_vpc.vpc_instance.id
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+## ROUTE TABLE 
+resource "aws_route_table" "public_rt" {
+  vpc_id = aws_vpc.vpc_main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
   }
+
+  tags = {
+    Name = "public-rt-terraform"
+  }
+
 }
 
-# LAUCH CONFIGURANTION INSTANCE
-resource "aws_launch_configuration" "config_instance" {
-  image_id        = "ami-09523541dfaa61c85"
-  instance_type   = "t1.micro"
-  security_groups = ["${aws_security_group.instance.id}"]
+## ROUTE TABLE ASSOCIATION 
+resource "aws_route_table_association" "public_rt_assoc_1" {
+  subnet_id      = aws_subnet.subnet_a.id
+  route_table_id = aws_route_table.public_rt.id
+}
 
-  user_data = <<-EOF
-      #!/bin/bash
-      echo "Hello World" > index.html
-      nohup busybox httpd -f -p ${var.server_port} &
-      EOF
+resource "aws_route_table_association" "public_rt_assoc_2" {
+  subnet_id      = aws_subnet.subnet_b.id
+  route_table_id = aws_route_table.public_rt.id
+}
 
+## TEMPLATE 
+resource "aws_launch_template" "templante_instance" {
+  name_prefix   = "instance-"
+  image_id      = "ami-09523541dfaa61c85"
+  instance_type = "t3.micro"
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "terraform-launch-template-instance"
+    }
+  }
+
+  monitoring {
+    enabled = true
+  }
   lifecycle {
     create_before_destroy = true
   }
+
+  user_data = filebase64("app.sh")
 
 }
 
 #AUTOSCALING GROUP 
 resource "aws_autoscaling_group" "asg_instance" {
 
-  launch_configuration = aws_launch_configuration.config_instance.id
-  availability_zones   = data.aws_availability_zones.all.names
+  launch_template {
+    id      = aws_launch_template.templante_instance.id
+    version = "$Latest"
+  }
+  min_size = 2
+  max_size = 4
 
-  load_balancers    = ["${aws_elb.elb_instance.name}"]
-  health_check_type = "ELB"
+  vpc_zone_identifier = [aws_subnet.subnet_a.id, aws_subnet.subnet_b.id]
 
-  min_size = 3
-  max_size = 6
+  target_group_arns = ["${aws_lb_target_group.lb_tg.arn}"]
+  health_check_type = "EC2"
 
   tag {
     key                 = "Name"
-    value               = "terraform-asg"
+    value               = "terraform-asg-instace"
     propagate_at_launch = true
   }
 }
 
 #ELB 
+resource "aws_lb" "lb_instance" {
+  name               = "lb-instances"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = ["${aws_security_group.sg_main.id}"]
+  subnets            = [aws_subnet.subnet_a.id, aws_subnet.subnet_b.id]
 
-resource "aws_elb" "elb_instance" {
-  name               = "asg-instance"
-  security_groups    = ["${aws_security_group.elb.id}"]
-  subnets            = [aws_subnet.vpc_subnet_instance.id]
+  enable_deletion_protection = false
 
-  listener {
-    lb_port           = 80
-    lb_protocol       = "http"
-    instance_port     = var.server_port
-    instance_protocol = "http"
-  }
 }
 
+## TARGET GRUOUP 
+resource "aws_lb_target_group" "lb_tg" {
+  name     = "lb-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.vpc_main.id
 
-## INSTANCE 
+  health_check {
+    interval            = 30
+    path                = "/"
+    protocol            = "HTTP"
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
 
-resource "aws_instance" "instance_micro" {
-  ami                    = "ami-09523541dfaa61c85"
-  instance_type          = "t1.micro"
-  subnet_id              = aws_subnet.vpc_subnet_instance.id
-  vpc_security_group_ids = ["${aws_security_group.instance.id}"]
-
-
-  user_data = <<-EOF
-      #!/bin/bash
-      echo "Hello World" > index.html
-      nohup busybox httpd -f -p ${var.server_port} &
-      EOF
+  }
 
   tags = {
-    Name = "INSTANCE_DEV_TERRAFORM"
+    Name = "lb-tg-terraform"
   }
-
-
 
 }
 
-## OUTPUTS 
+## LISTENER 
+resource "aws_lb_listener" "lb_listener" {
+  load_balancer_arn = aws_lb.lb_instance.arn
+  port              = "80"
+  protocol          = "HTTP"
 
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.lb_tg.arn
+  }
+}
+
+## ASSOCIACAO AUTO SCALING GROUP -> TARGET GROUP 
+resource "aws_autoscaling_attachment" "asg_attachment" {
+  autoscaling_group_name = aws_autoscaling_group.asg_instance.name
+  lb_target_group_arn    = aws_lb_target_group.lb_tg.arn
+
+}
+
+
+## OUTPUTS 
 output "public_ip" {
-  value = aws_elb.elb_instance.dns_name
+  value = aws_lb.lb_instance.dns_name
 
 }
